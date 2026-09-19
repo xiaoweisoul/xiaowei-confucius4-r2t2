@@ -1,0 +1,11 @@
+# 权重、虚拟环境、日志不入库(体积大且可再生)
+models/
+venvs/
+logs/
+run/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/

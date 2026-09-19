@@ -1,0 +1,84 @@
+diff --git a/ws_server.py b/ws_server.py
+index 0845ffc..44d6de0 100644
+--- a/ws_server.py
++++ b/ws_server.py
+@@ -281,9 +281,18 @@ async def initialize_models(app):
+     logger.info(f"step2: Start loading ASR model from {args.asr_model_path}")
+ 
+     # Streaming is vLLM-only and no forced aligner supported.
++    # 2026-09-19 xiaowei2 临时测试部署,两个参数都是为了和同卡 serving 的
++    # funasr_nano_2512 共存:
++    # 1) gpu_memory_utilization 原值 0.95 会把整卡显存全部预留给 vLLM,直接
++    #    挤掉 funasr。空闲约 35G,0.20 (约 14.6G) 对 2B 模型绰绰有余。
++    #    例:funasr 用 0.10 → ~7.3G;R2T2 用 0.20 → ~14.6G,互不干扰。
++    # 2) max_model_len 原默认 65536,按该长度 vLLM 至少要预留 7G KV cache,
++    #    在 0.20 预算下直接启动失败(ValueError)。限到 8192(音频 token 25/s,
++    #    约对应 5 分钟语音)后 KV cache 约 1G 出头,预算内即可启动。
+     asr_model =  R2T2ASRModel.LLM(
+         model=args.asr_model_path,
+-        gpu_memory_utilization=0.95, #0.8
++        gpu_memory_utilization=0.20,
++        max_model_len=8192,
+         max_new_tokens=1,
+     )
+ 
+@@ -527,8 +536,15 @@ async def asr_stream_api_v0(request: Request, ws: Websocket):
+                 stream_vad.reset()
+                 _logger.info(f"requestId={requestId}: stream_vad.reset() done")
+ 
++            # 2026-09-19 xiaowei2 测试发现:160ms 块下 step/1280=0 → 首轮预算
++            # max(1,0)=1,每轮只解码 1 个 token。噪声场景(white_5db)实测 13/30
++            # 条整句为空——第一个 token 稍一犹豫,文本就永远起不来(流式解码每轮
++            # 截断后从头再来)。同一音频直连用预算 2 就能完整识别。
++            # 把 floor 从 4 提到 8:160ms 中文语音约 2~6 字/块,预算 8 足够每轮
++            # 吐完当轮内容,同时仍限制单轮解码时长(实测 asr_cost 17→30ms)。
++            # 两处分别在流式/一次性两个 handler,保持一致,只改我们用的流式 handler。
+             max_new_tokens = max(1, int((step + lookahead) / 1280))
+-            max_new_tokens_floor = min(32, max(4,2 * int(step / 1280)))
++            max_new_tokens_floor = min(32, max(8,2 * int(step / 1280)))
+             is_first = True
+             total_secs = LOOKAHEAD_MS / 1000.0
+             is_halluc = False
+@@ -552,7 +568,11 @@ async def asr_stream_api_v0(request: Request, ws: Websocket):
+                 if isinstance(data, str):
+                     if data == YOUDAO_ONETIME_ASR_EOS_STRING:
+                         _logger.info(f"requestId {requestId}: client sent EOS. closing connection.")
+-                        first_max_new_tokens = max(1, int((step + lookahead) / 1280))
++                        # 2026-09-19 xiaowei2 测试发现:原值 (step+lookahead)/1280=320/1280→0
++                        # 取 max(1,·)=1,收尾只允许解码 1 个 token,LSP 未提交的尾部
++                        # token 吐不完(实测丢"的空调,温度调到二十六度"整段尾巴)。
++                        # 收尾是一锤子买卖,给足预算 8,把所有未稳定 token 一次吐完。
++                        first_max_new_tokens = max(8, int((step + lookahead) / 1280))
+                         text= asr_model.finish_streaming_transcribe(
+                             asr_state, first_max_new_tokens
+                         )
+@@ -979,8 +999,15 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
+                 stream_vad.reset()
+                 _logger.info(f"requestId={requestId}: stream_vad.reset() done")
+ 
++            # 2026-09-19 xiaowei2 测试发现:160ms 块下 step/1280=0 → 首轮预算
++            # max(1,0)=1,每轮只解码 1 个 token。噪声场景(white_5db)实测 13/30
++            # 条整句为空——第一个 token 稍一犹豫,文本就永远起不来(流式解码每轮
++            # 截断后从头再来)。同一音频直连用预算 2 就能完整识别。
++            # 把 floor 从 4 提到 8:160ms 中文语音约 2~6 字/块,预算 8 足够每轮
++            # 吐完当轮内容,同时仍限制单轮解码时长(实测 asr_cost 17→30ms)。
++            # 两处分别在流式/一次性两个 handler,保持一致,只改我们用的流式 handler。
+             max_new_tokens = max(1, int((step + lookahead) / 1280))
+-            max_new_tokens_floor = min(32, max(4,2 * int(step / 1280)))
++            max_new_tokens_floor = min(32, max(8,2 * int(step / 1280)))
+             is_first = True
+             total_secs = LOOKAHEAD_MS / 1000.0
+             is_halluc = False
+@@ -1004,7 +1031,11 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
+                 if isinstance(data, str):
+                     if data == YOUDAO_ONETIME_ASR_EOS_STRING:
+                         _logger.info(f"requestId {requestId}: client sent EOS. closing connection.")
+-                        first_max_new_tokens = max(1, int((step + lookahead) / 1280))
++                        # 2026-09-19 xiaowei2 测试发现:原值 (step+lookahead)/1280=320/1280→0
++                        # 取 max(1,·)=1,收尾只允许解码 1 个 token,LSP 未提交的尾部
++                        # token 吐不完(实测丢"的空调,温度调到二十六度"整段尾巴)。
++                        # 收尾是一锤子买卖,给足预算 8,把所有未稳定 token 一次吐完。
++                        first_max_new_tokens = max(8, int((step + lookahead) / 1280))
+                         text= asr_model.finish_streaming_transcribe_no_reset(
+                             asr_state, first_max_new_tokens
+                         )
