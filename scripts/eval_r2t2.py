@@ -12,7 +12,7 @@ R2T2 协议要点（区别于 funasr）：
 3. 返回的 msg.text 是增量片段，需要全部拼接。
 
 用法：
-  /mnt/asr/r2t2_test/venvs/r2t2/bin/python eval_r2t2.py [--limit N] [--concurrency K]
+  /mnt/asr/confucius4-r2t2/venvs/r2t2/bin/python eval_r2t2.py [--limit N] [--concurrency K]
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ import websockets
 R2T2_WS = "ws://127.0.0.1:18272/asr_stream_api_v1"
 EVAL_ROOT = Path("/mnt/asr/hojo_asr_multi_v1/eval_dataset")
 MANIFEST = EVAL_ROOT / "manifest_eval.json"
-OUT_DIR = Path("/mnt/asr/r2t2_test/eval_results")
+OUT_DIR = Path("/mnt/asr/confucius4-r2t2/eval_results")
 CHUNK_MS = 160
 SAMPLE_RATE = 16000
 EOS = "YOUDAO_ONETIME_ASR_STREAM_EOS"

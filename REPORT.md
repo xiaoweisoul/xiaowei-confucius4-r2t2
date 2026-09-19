@@ -41,24 +41,24 @@ GPU 占用 14.2G(util 0.20),与 funasr(10G)同卡共存无冲突。
 
 ## 4. 部署位置(全部独立于 funasr_nano_2512)
 
-- 模型:`/mnt/asr/r2t2_test/models/Confucius4-R2T2`(3.9G,ModelScope)
-- VAD:`/mnt/asr/r2t2_test/models/vad/Stream-VAD`(FireRedVAD)
-- venv:`/mnt/asr/r2t2_test/venvs/r2t2`(复用 funasr venv 的 torch 2.11+cu130
+- 模型:`/mnt/asr/confucius4-r2t2/models/Confucius4-R2T2`(3.9G,ModelScope)
+- VAD:`/mnt/asr/confucius4-r2t2/models/vad/Stream-VAD`(FireRedVAD)
+- venv:`/mnt/asr/confucius4-r2t2/venvs/r2t2`(复用 funasr venv 的 torch 2.11+cu130
   + vllm 0.23.0 site-packages,再装 qwen-asr/fireredvad/sanic 小包)
 - 代码:`/tmp/r2t2_repo`(github 克隆 + 本地补丁,见第 5 节)
 - 服务:端口 18272,启动命令在 `logs/ws_server_start_cmd.txt` 风格见下:
 
 ```bash
-cd /mnt/asr/r2t2_test/run && CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/tmp/r2t2_repo \
-nohup /mnt/asr/r2t2_test/venvs/r2t2/bin/python -u /tmp/r2t2_repo/ws_server.py \
-  -p 18272 -m /mnt/asr/r2t2_test/models/Confucius4-R2T2 \
-  --vad_model_path /mnt/asr/r2t2_test/models/vad/Stream-VAD \
-  > /mnt/asr/r2t2_test/logs/ws_server.log 2>&1 &
+cd /mnt/asr/confucius4-r2t2/run && CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/tmp/r2t2_repo \
+nohup /mnt/asr/confucius4-r2t2/venvs/r2t2/bin/python -u /tmp/r2t2_repo/ws_server.py \
+  -p 18272 -m /mnt/asr/confucius4-r2t2/models/Confucius4-R2T2 \
+  --vad_model_path /mnt/asr/confucius4-r2t2/models/vad/Stream-VAD \
+  > /mnt/asr/confucius4-r2t2/logs/ws_server.log 2>&1 &
 ```
 
-- 评测脚本:`/mnt/asr/r2t2_test/eval_r2t2.py`(与 hojo eval_run.py 同口径)
-- 延迟探针:`/mnt/asr/r2t2_test/r2t2_latency_probe.py`
-- 结果:`/mnt/asr/r2t2_test/eval_results/r2t2.{md,json}`
+- 评测脚本:`/mnt/asr/confucius4-r2t2/eval_r2t2.py`(与 hojo eval_run.py 同口径)
+- 延迟探针:`/mnt/asr/confucius4-r2t2/r2t2_latency_probe.py`
+- 结果:`/mnt/asr/confucius4-r2t2/eval_results/r2t2.{md,json}`
 
 ## 5. 官方代码缺陷(切换前必须处理)
 
