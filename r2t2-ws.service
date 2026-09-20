@@ -1,0 +1,18 @@
+[Unit]
+Description=Xiaowei Confucius4-R2T2 Realtime WebSocket ASR Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/mnt/asr/confucius4-r2t2
+ExecStartPre=/usr/bin/nvidia-modprobe -u -c=0
+ExecStart=/mnt/asr/confucius4-r2t2/repo/scripts/start_r2t2_ws.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/mnt/asr/confucius4-r2t2/logs/r2t2_ws.log
+StandardError=append:/mnt/asr/confucius4-r2t2/logs/r2t2_ws.log
+
+[Install]
+WantedBy=multi-user.target

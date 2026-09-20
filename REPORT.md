@@ -45,15 +45,14 @@ GPU 占用 14.2G(util 0.20),与 funasr(10G)同卡共存无冲突。
 - VAD:`/mnt/asr/confucius4-r2t2/models/vad/Stream-VAD`(FireRedVAD)
 - venv:`/mnt/asr/confucius4-r2t2/venvs/r2t2`(复用 funasr venv 的 torch 2.11+cu130
   + vllm 0.23.0 site-packages,再装 qwen-asr/fireredvad/sanic 小包)
-- 代码:`/tmp/r2t2_repo`(github 克隆 + 本地补丁,见第 5 节)
-- 服务:端口 18272,启动命令在 `logs/ws_server_start_cmd.txt` 风格见下:
+- 代码:`/mnt/asr/confucius4-r2t2/server`(github 克隆 + 本地补丁的持久副本,
+  见第 5 节;最初在 /tmp/r2t2_repo,重启会丢,已迁出)
+- 服务:端口 18272,由 systemd 托管(`r2t2-ws.service`,参照 funasr-ws.service):
 
 ```bash
-cd /mnt/asr/confucius4-r2t2/run && CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/tmp/r2t2_repo \
-nohup /mnt/asr/confucius4-r2t2/venvs/r2t2/bin/python -u /tmp/r2t2_repo/ws_server.py \
-  -p 18272 -m /mnt/asr/confucius4-r2t2/models/Confucius4-R2T2 \
-  --vad_model_path /mnt/asr/confucius4-r2t2/models/vad/Stream-VAD \
-  > /mnt/asr/confucius4-r2t2/logs/ws_server.log 2>&1 &
+cp repo/r2t2-ws.service /etc/systemd/system/ && systemctl daemon-reload
+systemctl enable --now r2t2-ws     # 开机自启 + 崩溃自动拉起(Restart=on-failure)
+journalctl -u r2t2-ws -f           # 或看 logs/r2t2_ws.log
 ```
 
 - 评测脚本:`/mnt/asr/confucius4-r2t2/eval_r2t2.py`(与 hojo eval_run.py 同口径)
@@ -62,8 +61,8 @@ nohup /mnt/asr/confucius4-r2t2/venvs/r2t2/bin/python -u /tmp/r2t2_repo/ws_server
 
 ## 5. 官方代码缺陷(切换前必须处理)
 
-评测过程踩了 3 个坑,根因都在官方 `ws_server.py`/`r2t2` 包,已在 `/tmp/r2t2_repo`
-本地修复或绕过:
+评测过程踩了 3 个坑,根因都在官方 `ws_server.py`/`r2t2` 包,已在
+`server/` 目录(原 /tmp/r2t2_repo)本地修复或绕过:
 
 1. **v1 路由 language=None 时丢整轮文本**:`streaming_transcribe_no_reset` 在
    模型输出无 `<asr_text>` 标签且未显式指定语言时,把该轮解码文本直接清空
@@ -87,4 +86,5 @@ no_reset),官方 README 未说明差异;demo 素材走的是清晰音频,掩盖�
   需求需补测。
 - 说话人分离:R2T2 无 diarization,funasr 现网带 eres2netv2。若业务依赖需保留
   funasr 侧或另配。
-- 服务为手动 nohup,重启机器不会自启;确认切流后再做 systemd。
+- ~~服务为手动 nohup,重启机器不会自启~~ 已完成:2026-09-20 切到
+  systemd(`r2t2-ws.service`),开机自启 + 崩溃自动拉起。

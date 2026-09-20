@@ -19,7 +19,9 @@ serving 的 funasr_nano_2512(Fun-ASR-Nano,0.8B)。
 
 ```
 ├── REPORT.md              # 完整评测报告(精度/延迟/缺陷清单/部署命令)
+├── r2t2-ws.service        # systemd 单元(参照 funasr-ws.service)
 ├── scripts/
+│   ├── start_r2t2_ws.sh   # 服务启动脚本(systemd ExecStart 入口,支持 R2T2_* 覆盖)
 │   ├── eval_r2t2.py       # 312 条评测脚本,与 hojo eval_run.py 同口径
 │   └── r2t2_latency_probe.py  # 实时节奏延迟探针
 ├── eval_results/
@@ -27,6 +29,14 @@ serving 的 funasr_nano_2512(Fun-ASR-Nano,0.8B)。
 │   └── r2t2.json          # 逐条原始结果(REF/HYP/CER)
 └── patches/
     └── 0001-ws-server-budget-and-deploy-fixes.patch  # 官方服务端修复补丁
+```
+
+## 服务部署(systemd)
+
+```bash
+cp r2t2-ws.service /etc/systemd/system/ && systemctl daemon-reload
+systemctl enable --now r2t2-ws     # 开机自启 + 崩溃自动拉起
+journalctl -u r2t2-ws -f           # 或看 logs/r2t2_ws.log
 ```
 
 ## 官方代码缺陷与补丁
