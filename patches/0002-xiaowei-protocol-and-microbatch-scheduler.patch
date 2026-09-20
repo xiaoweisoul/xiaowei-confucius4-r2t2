@@ -1,0 +1,1354 @@
+diff --git a/asr_decode_scheduler.py b/asr_decode_scheduler.py
+new file mode 100644
+index 0000000..382e835
+--- /dev/null
++++ b/asr_decode_scheduler.py
+@@ -0,0 +1,287 @@
++# coding=utf-8
++"""R2T2 ASR 解码调度器 v3:微批合批(xiaowei 协议路由专用)。
++
++演进史(三版,教训都在这):
++- v1 单 worker 串行:安全,但 8 路并发 queue_wait P95=117ms 超标
++  (8 路 × 17ms/块 的排队是数学上限)。
++- v2 多 worker 并行:实测 vLLM V1 同步 LLM.generate **线程不安全**,
++  并发调用触发 EngineCore 崩溃(Assertion failed: !_current_out,
++  router.cpp:166),整个服务挂死 → 弃用。
++- v3(本版)微批合批:回到单 worker,但窗口内(默认 15ms)收集多路
++  job,通过 r2t2_asr.batch_streaming_decode_step 合成**一次**
++  generate([inp1, inp2, ...]) 调用——由 vLLM 连续批处理在引擎内部
++  并行消化多路,线程安全(单线程调用)且吞吐高(批推理)。
++  这正是 funasr asr_decode_scheduler 的原版设计思路。
++
++worker 里的执行体不再是"每 job 一个闭包",而是"攒一批 → 一次批量调用
++→ 按序分发结果"。partial 去重(completed 优先级)语义保留:
++- high(completed/finish)任务插队语义弱化为"先于窗口内 partial 执行"
++  (跨批不等待:有 high 任务时立刻收窗口)。
++
++接口变化(对路由):
++decode_batch(jobs) 提交一个会话本块的全部信息(state/audio/budget),
++调度器按 partial_key 去重后在 worker 里与其他会话合批。
++"""
++from __future__ import annotations
++
++import asyncio
++import logging
++import time
++import uuid
++from collections import OrderedDict, deque
++from concurrent.futures import ThreadPoolExecutor
++from dataclasses import dataclass, field
++from typing import Any, Callable, Deque, Dict, List, Optional
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass
++class ASRDecodeJob:
++    """一个待解码任务:携带批量化所需的三元组,由 batch API 消费。
++
++    decode_payload = (vad_instance, asr_state, pcm16k, max_new_tokens)
++    worker 不修改 payload 内容,只透传给 batch_fn。
++    字段顺序注意:dataclass 无默认值字段必须在有默认值字段之前。
++    """
++
++    job_id: str
++    job_type: str  # "user_partial" | "completed"
++    submitted_ts: float
++    future: "asyncio.Future"
++    decode_fn: Optional[Callable[[], Any]] = None  # completed 类任务的单会话闭包
++    decode_payload: Optional[tuple] = None  # partial 类任务的批量四元组
++    partial_key: str = ""
++    cancelled: bool = False
++
++
++class ASRDecodeScheduler:
++    """微批解码调度器:单 worker 线程 + 15ms 收集窗口 + 合批 generate。
++
++    并发边界:
++    - 全进程唯一 executor(max_workers=1):vLLM 同步引擎只被这一个
++      线程调用(线程安全,2026-09-21 v2 版崩溃教训)。
++    - asyncio 侧经 run_in_executor 提交,事件循环零阻塞。
++    - 同 partial_key 去重:窗口等待期间同会话新块覆盖旧块(音频在涨,
++      旧快照过时),旧 job 返回 None。
++    """
++
++    def __init__(self, micro_batch_wait_ms: int = 15) -> None:
++        self.micro_batch_wait_ms = max(0, int(micro_batch_wait_ms))
++        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="r2t2-decode")
++        self.loop: Optional[asyncio.AbstractEventLoop] = None
++        self.high_jobs: Optional[Deque[ASRDecodeJob]] = None
++        self.partial_jobs: Optional["OrderedDict[str, ASRDecodeJob]"] = None
++        self.latest_partial_jobs: Dict[str, ASRDecodeJob] = {}
++        self.job_event: Optional[asyncio.Event] = None
++        self.worker_task: Optional[asyncio.Task] = None
++        self.closed = False
++        # worker 线程里执行批量调用的入口,由使用方(路由装配处)注入:
++        # batch_fn(jobs_payloads) -> results(与输入等长)
++        self.batch_fn: Optional[Callable[[list], list]] = None
++
++    # ---- 生命周期 ----
++
++    def _ensure_worker(self) -> None:
++        loop = asyncio.get_running_loop()
++        if self.loop is not None and self.loop is not loop:
++            raise RuntimeError("ASRDecodeScheduler can only be used by one asyncio loop")
++        if self.worker_task is not None:
++            return
++        self.loop = loop
++        self.high_jobs = deque()
++        self.partial_jobs = OrderedDict()
++        self.job_event = asyncio.Event()
++        self.worker_task = loop.create_task(self._worker_loop())
++        logger.info("ASRDecodeScheduler started (micro_batch_wait_ms=%s)",
++                    self.micro_batch_wait_ms)
++
++    def shutdown(self) -> None:
++        self.closed = True
++        if self.worker_task is not None:
++            self.worker_task.cancel()
++        if self.partial_jobs is not None:
++            for job in list(self.partial_jobs.values()):
++                self._set_empty_result(job)
++            self.partial_jobs.clear()
++        self.latest_partial_jobs.clear()
++        if self.high_jobs is not None:
++            while self.high_jobs:
++                self._set_empty_result(self.high_jobs.popleft())
++        self.executor.shutdown(wait=False)
++        logger.info("ASRDecodeScheduler shutdown")
++
++    # ---- 内部 ----
++
++    def _queue_depth(self) -> int:
++        high = len(self.high_jobs) if self.high_jobs is not None else 0
++        part = len(self.partial_jobs) if self.partial_jobs is not None else 0
++        return high + part
++
++    def _set_empty_result(self, job: ASRDecodeJob) -> None:
++        if not job.future.done():
++            job.future.set_result(None)
++
++    def _remove_latest_partial(self, job: ASRDecodeJob) -> None:
++        if job.job_type != "user_partial":
++            return
++        if self.latest_partial_jobs.get(job.partial_key) is job:
++            self.latest_partial_jobs.pop(job.partial_key, None)
++
++    def _drop_if_cancelled(self, job: ASRDecodeJob) -> bool:
++        if not job.cancelled and not job.future.done():
++            return False
++        self._remove_latest_partial(job)
++        logger.info("decode_job_dropped job_id=%s job_type=%s drop_reason=cancelled queue_depth=%s",
++                    job.job_id, job.job_type, self._queue_depth())
++        return True
++
++    # ---- 执行 ----
++
++    def _run_sync(self, high_job: Optional[ASRDecodeJob],
++                  batch_payloads: List[tuple], batch_jobs: List[ASRDecodeJob]) -> None:
++        """worker 线程执行体:先跑高优单会话任务,再跑合批任务。
++
++        high 任务(finish/段收口)单独执行:它们依赖 state 的终态语义,
++        不与其他会话的 partial 混批(收口预算大,混批会拉长整批延迟)。
++        """
++        if high_job is not None:
++            try:
++                result = high_job.decode_fn()
++                if not high_job.future.done():
++                    high_job.future.set_result(result)
++            except Exception:
++                logger.exception("decode_job_failed job_id=%s job_type=%s",
++                                 high_job.job_id, high_job.job_type)
++                if not high_job.future.done():
++                    high_job.future.set_exception(
++                        RuntimeError(f"decode failed for job {high_job.job_id}"))
++        if not batch_payloads:
++            return
++        batch_start = time.perf_counter()
++        try:
++            results = self.batch_fn(batch_payloads)
++        except Exception:
++            logger.exception("decode_batch_failed size=%s", len(batch_payloads))
++            results = [None] * len(batch_payloads)
++        inference_ms = int((time.perf_counter() - batch_start) * 1000)
++        logger.info("decode_batch size=%s inference_ms=%s", len(batch_payloads), inference_ms)
++        for job, result in zip(batch_jobs, results):
++            self._remove_latest_partial(job)
++            if not job.future.done():
++                job.future.set_result(result)
++
++    async def _worker_loop(self) -> None:
++        """单 worker:高优任务立即执行;partial 攒窗口合批。
++
++        窗口逻辑:取到 partial 队头后等 micro_batch_wait_ms,让同时刻
++        到达的其他会话的块进同批;窗口期间若有 high 任务到达,high
++        优先(本轮先跑 high,partial 顺延)。
++        """
++        while not self.closed:
++            await self.job_event.wait()
++            while not self.closed:
++                # 1) 高优任务零等待执行
++                while self.high_jobs and not self.closed:
++                    job = self.high_jobs.popleft()
++                    if self._drop_if_cancelled(job):
++                        continue
++                    await self._run_in_executor(job, [], [])
++                    break
++
++                # 2) partial:收窗口合批
++                if not self.partial_jobs:
++                    self.job_event.clear()
++                    if not self.high_jobs:
++                        break
++                    continue
++                if self.micro_batch_wait_ms > 0:
++                    await asyncio.sleep(self.micro_batch_wait_ms / 1000)
++                # 高优插队:窗口刚开时来了收口任务,先跑它
++                if self.high_jobs:
++                    continue
++
++                batch_jobs: List[ASRDecodeJob] = []
++                batch_payloads: List[tuple] = []
++                while self.partial_jobs and len(batch_jobs) < 32:
++                    _key, job = self.partial_jobs.popitem(last=False)
++                    if self._drop_if_cancelled(job):
++                        continue
++                    batch_jobs.append(job)
++                    batch_payloads.append(job.decode_payload)
++                if not batch_jobs:
++                    continue
++                await self._run_in_executor(None, batch_payloads, batch_jobs)
++
++    async def _run_in_executor(self, high_job, batch_payloads, batch_jobs) -> None:
++        submitted = [j.submitted_ts for j in batch_jobs]
++        if high_job is not None:
++            submitted.append(high_job.submitted_ts)
++        run_start = time.perf_counter()
++        await self.loop.run_in_executor(
++            self.executor, self._run_sync, high_job, batch_payloads, batch_jobs)
++        finished = time.perf_counter()
++        for j, ts in zip(batch_jobs, submitted):
++            logger.info("decode_job_finished job_id=%s job_type=%s queue_wait_ms=%s "
++                        "total_decode_ms=%s queue_depth=%s",
++                        j.job_id, j.job_type, int((run_start - ts) * 1000),
++                        int((finished - ts) * 1000), self._queue_depth())
++        if high_job is not None:
++            logger.info("decode_job_finished job_id=%s job_type=completed queue_wait_ms=%s "
++                        "total_decode_ms=%s",
++                        high_job.job_id, int((run_start - high_job.submitted_ts) * 1000),
++                        int((finished - high_job.submitted_ts) * 1000))
++
++    # ---- 对外接口 ----
++
++    async def decode(self, *, job_type: str, decode_fn: Callable[[], Any] = None,
++                     decode_payload: tuple = None, partial_key: str = "") -> Any:
++        """提交解码并等待结果。
++
++        - job_type="user_partial":decode_payload=(state, pcm, budget),
++          走合批路径;同 partial_key 新任务取消旧任务(返回 None)。
++        - job_type="completed":decode_fn=单会话闭包,高优先级立即执行。
++        """
++        if self.closed:
++            return None
++        if job_type == "user_partial" and self.batch_fn is None:
++            raise RuntimeError("batch_fn not configured for partial jobs")
++
++        self._ensure_worker()
++        loop = asyncio.get_running_loop()
++        job = ASRDecodeJob(
++            job_id=uuid.uuid4().hex[:16],
++            job_type=job_type,
++            submitted_ts=time.perf_counter(),
++            future=loop.create_future(),
++            decode_fn=decode_fn,
++            decode_payload=decode_payload,
++            partial_key=partial_key,
++        )
++
++        if job_type == "user_partial":
++            old_job = self.latest_partial_jobs.get(partial_key)
++            if old_job is not None and old_job is not job:
++                old_job.cancelled = True
++                self._set_empty_result(old_job)
++                self.partial_jobs.pop(partial_key, None)
++                logger.info("decode_job_superseded old_job_id=%s new_job_id=%s partial_key=%s",
++                            old_job.job_id, job.job_id, partial_key)
++            self.partial_jobs[partial_key] = job
++            self.latest_partial_jobs[partial_key] = job
++        else:
++            self.high_jobs.append(job)
++
++        self.job_event.set()
++        try:
++            return await job.future
++        except asyncio.CancelledError:
++            job.cancelled = True
++            if job.job_type == "user_partial":
++                if self.partial_jobs.get(partial_key) is job:
++                    self.partial_jobs.pop(partial_key, None)
++                if self.latest_partial_jobs.get(partial_key) is job:
++                    self.latest_partial_jobs.pop(partial_key, None)
++            logger.info("decode_job_dropped job_id=%s job_type=%s drop_reason=caller_cancelled",
++                        job.job_id, job.job_type)
++            raise
+diff --git a/r2t2/r2t2_asr.py b/r2t2/r2t2_asr.py
+index 9967217..8083dc3 100644
+--- a/r2t2/r2t2_asr.py
++++ b/r2t2/r2t2_asr.py
+@@ -577,6 +577,175 @@ class R2T2ASRModel(Qwen3ASRModel):
+         print(f"finish state.text={state.text}")
+         return state.text
+ 
++    # ---- 批量流式解码(xiaowei 协议路由专用,v0/v1 不使用) ----
++    # 动机(2026-09-21 压测):多线程并发调 vLLM generate → EngineCore 崩溃;
++    # 单线程逐路串行 → 8 路排队 P95=117ms 超标。generate 本身接受输入
++    # 列表,把 N 路组装好的输入合一次调用,由 vLLM 连续批处理并行消化。
++    # 拆分方式:单会话版循环体 = 组输入 | generate | 应用输出 三段,
++    # 前后两段无 GPU 且只碰各自 state;中间 generate 批量化。
++    # 以下代码从 streaming_transcribe_no_reset 复制,勿手改——上游更新
++    # 时以它为基准同步,保证 v0/v1 与 xiaowei 路由行为一致。
++
++    def _batch_consume_chunk(self, state, pcm16k):
++        """组输入段:消费 buffer 一个完整块,返回 vLLM inp(或 None)。
++
++        复制自单会话版:16s 滑窗裁剪 + rollback prefix + prompt 拼接。
++        只读改单会话 state,无 GPU;调度器单 worker 串行调用。
++        """
++        x = np.asarray(pcm16k)
++        if x.ndim != 1:
++            x = x.reshape(-1)
++        if x.dtype == np.int16:
++            x = (x.astype(np.float32) / 32768.0)
++        else:
++            x = x.astype(np.float32, copy=False)
++        if x.shape[0] > 0:
++            state.buffer = np.concatenate([state.buffer, x], axis=0)
++        if state.buffer.shape[0] < state.chunk_size_samples:
++            return None
++
++        chunk = state.buffer[: state.chunk_size_samples]
++        state.buffer = state.buffer[state.chunk_size_samples:]
++        if state.audio_accum.shape[0] == 0:
++            state.audio_accum = chunk
++        else:
++            state.audio_accum = np.concatenate([state.audio_accum, chunk], axis=0)
++
++        max_samples = 16 * SAMPLE_RATE
++        discard_samples = 8 * SAMPLE_RATE
++        if state.audio_accum.shape[0] > max_samples:
++            keep_samples = state.audio_accum.shape[0] - discard_samples
++            normal_chunk_samples = 2560
++            if not state._first_chunk_discarded:
++                first_chunk_samples = 5120
++                discard_chunks = 1 + (discard_samples - first_chunk_samples) // normal_chunk_samples
++                state._first_chunk_discarded = True
++            else:
++                discard_chunks = discard_samples // normal_chunk_samples
++            state.audio_accum = state.audio_accum[-keep_samples:]
++            state.chunk_text = state.chunk_text[discard_chunks:]
++
++        prefix_text = "".join(state.chunk_text)
++        if state.force_language == None and state.language != "":
++            prefix = f"language {state.language}<asr_text>" + prefix_text
++        else:
++            prefix = prefix_text
++        prefix = prefix.split("|")[0]
++        prompt = state.prompt_raw + prefix
++        return {"prompt": prompt, "multi_modal_data": {"audio": [state.audio_accum]}}
++
++    def _batch_apply_output(self, state, gen_text, rollback_punctuation=False):
++        """应用输出段:把 gen_text 解析回 state(与单会话版逐行一致)。
++
++        返回 None(与单会话版"该块无有效输出 continue"语义一致);
++        正常时更新 state.text/last_fixed_text/chunk_text/chunk_id。
++        """
++        gen_text = _normalize_punct_by_context(gen_text).replace('\ufffd', '')
++        prefix_text = "".join(state.chunk_text)
++        if state.force_language == None and state.language != "":
++            prefix = f"language {state.language}<asr_text>" + prefix_text
++        else:
++            prefix = prefix_text
++        prefix = prefix.split("|")[0]
++
++        state._raw_decoded = (prefix + gen_text) if prefix is not None else gen_text
++
++        if state.force_language == None:
++            lang,_ = parse_language_output(state._raw_decoded, user_language=state.force_language)
++
++        if state.force_language == "Chinese" or lang == "Chinese":
++            state._raw_decoded = re.sub(r'(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])', '', state._raw_decoded)
++        lang, txt = parse_asr_output(state._raw_decoded, user_language=state.force_language)
++        has_tag = "<asr_text>" in state._raw_decoded
++        if has_tag:
++            state._raw_decoded = state._raw_decoded.split("<asr_text>")[0] + "<asr_text>" + txt
++        else:
++            state._raw_decoded = txt
++
++        state._raw_decoded = state._raw_decoded.split("|")[0]
++        cur_ids = self.processor.tokenizer.encode(state._raw_decoded)
++        if rollback_punctuation == True:
++            _punct = "，。！？、；：,.!?;:"
++            raw_stripped = state._raw_decoded.strip()
++            if raw_stripped and raw_stripped[-1] in _punct:
++                k = 0
++            else:
++                k = int(state.unfixed_token_num)
++        else:
++            k = int(state.unfixed_token_num)
++
++        has_tag = "<asr_text>" in state._raw_decoded
++        if has_tag and state._raw_decoded.split('<asr_text>')[1] == "":
++            k = 0
++        while True:
++            end_idx = max(0, len(cur_ids) - k)
++            fixed_text = self.processor.tokenizer.decode(cur_ids[:end_idx]) if end_idx > 0 else ""
++            if '\ufffd' not in fixed_text:
++                break
++            else:
++                if end_idx == 0:
++                    fixed_text = ""
++                    break
++                k += 1
++        has_tag = "<asr_text>" in fixed_text
++        if has_tag:
++            meta_part, fixed_text  = fixed_text.split("<asr_text>", 1)
++
++        has_tag = "<asr_text>" in state._raw_decoded
++        if not has_tag and state.force_language == None:
++            # 单会话版此处 continue 丢弃整块;xiaowei 路由语言恒显式,
++            # 该分支理论上不达;保留防御(返回 None 表示无有效输出)。
++            return None
++
++        state.language = lang
++        state.text = txt.split("|")[0]
++
++        state.chunk_id += 1
++        prefix_stripped = prefix_text.strip()
++        fixed_text_stripped = fixed_text.strip()
++        if fixed_text_stripped.startswith(prefix_stripped):
++            new_asr_text = fixed_text_stripped[len(prefix_stripped):]
++        else:
++            new_asr_text = ""
++        new_asr_text = new_asr_text.split("|")[0]
++        state.chunk_text.append(new_asr_text)
++        state.last_fixed_text = state.last_fixed_text + new_asr_text
++        return (state.text, state.last_fixed_text)
++
++    def batch_streaming_decode_step(self, jobs):
++        """批量解码入口:jobs = [(state, pcm16k, max_new_tokens), ...]。
++
++        全部在调用方线程(调度器 worker)执行:
++        1) 各会话 _batch_consume_chunk 组输入
++        2) 一次 model.generate(inputs, sampling_params=列表)
++        3) 各会话 _batch_apply_output 更新 state
++        返回与 jobs 等长列表:None(无块可解)或 (text, last_fixed_text)。
++        """
++        from vllm import SamplingParams
++
++        inputs = []
++        active = []
++        for idx, (state, pcm16k, max_new_tokens) in enumerate(jobs):
++            inp = self._batch_consume_chunk(state, pcm16k)
++            if inp is not None:
++                inputs.append(inp)
++                active.append((idx, state, max_new_tokens))
++
++        if not inputs:
++            return [None] * len(jobs)
++
++        sp_list = [
++            SamplingParams(temperature=0.0, max_tokens=max(1, int(b)) if b is not None else 2048,
++                           skip_special_tokens=True)
++            for _idx, _st, b in active
++        ]
++        outputs = self.model.generate(inputs, sampling_params=sp_list, use_tqdm=False)
++
++        results = [None] * len(jobs)
++        for (idx, state, _b), out in zip(active, outputs):
++            results[idx] = self._batch_apply_output(state, out.outputs[0].text)
++        return results
++
+     def streaming_transcribe_no_reset(
+         self,
+         pcm16k: np.ndarray,
+diff --git a/ws_server.py b/ws_server.py
+index 0845ffc..9bc8510 100644
+--- a/ws_server.py
++++ b/ws_server.py
+@@ -28,6 +28,10 @@ import asyncio
+ import logging
+ import re
+ from sanic.worker.process import WorkerProcess  # Compatible with Sanic v23.12+; older versions may need: from sanic.worker.manager import WorkerProcess
++from sanic.exceptions import Unauthorized
++
++from asr_decode_scheduler import ASRDecodeScheduler
++from xiaowei_ws_route import build_xiaowei_ws_handler
+ 
+ 
+ # Common Chinese and English punctuation characters for hallucination detection
+@@ -281,9 +285,18 @@ async def initialize_models(app):
+     logger.info(f"step2: Start loading ASR model from {args.asr_model_path}")
+ 
+     # Streaming is vLLM-only and no forced aligner supported.
++    # 2026-09-19 xiaowei2 临时测试部署,两个参数都是为了和同卡 serving 的
++    # funasr_nano_2512 共存:
++    # 1) gpu_memory_utilization 原值 0.95 会把整卡显存全部预留给 vLLM,直接
++    #    挤掉 funasr。空闲约 35G,0.20 (约 14.6G) 对 2B 模型绰绰有余。
++    #    例:funasr 用 0.10 → ~7.3G;R2T2 用 0.20 → ~14.6G,互不干扰。
++    # 2) max_model_len 原默认 65536,按该长度 vLLM 至少要预留 7G KV cache,
++    #    在 0.20 预算下直接启动失败(ValueError)。限到 8192(音频 token 25/s,
++    #    约对应 5 分钟语音)后 KV cache 约 1G 出头,预算内即可启动。
+     asr_model =  R2T2ASRModel.LLM(
+         model=args.asr_model_path,
+-        gpu_memory_utilization=0.95, #0.8
++        gpu_memory_utilization=0.20,
++        max_model_len=8192,
+         max_new_tokens=1,
+     )
+ 
+@@ -527,8 +540,15 @@ async def asr_stream_api_v0(request: Request, ws: Websocket):
+                 stream_vad.reset()
+                 _logger.info(f"requestId={requestId}: stream_vad.reset() done")
+ 
++            # 2026-09-19 xiaowei2 测试发现:160ms 块下 step/1280=0 → 首轮预算
++            # max(1,0)=1,每轮只解码 1 个 token。噪声场景(white_5db)实测 13/30
++            # 条整句为空——第一个 token 稍一犹豫,文本就永远起不来(流式解码每轮
++            # 截断后从头再来)。同一音频直连用预算 2 就能完整识别。
++            # 把 floor 从 4 提到 8:160ms 中文语音约 2~6 字/块,预算 8 足够每轮
++            # 吐完当轮内容,同时仍限制单轮解码时长(实测 asr_cost 17→30ms)。
++            # 两处分别在流式/一次性两个 handler,保持一致,只改我们用的流式 handler。
+             max_new_tokens = max(1, int((step + lookahead) / 1280))
+-            max_new_tokens_floor = min(32, max(4,2 * int(step / 1280)))
++            max_new_tokens_floor = min(32, max(8,2 * int(step / 1280)))
+             is_first = True
+             total_secs = LOOKAHEAD_MS / 1000.0
+             is_halluc = False
+@@ -552,7 +572,11 @@ async def asr_stream_api_v0(request: Request, ws: Websocket):
+                 if isinstance(data, str):
+                     if data == YOUDAO_ONETIME_ASR_EOS_STRING:
+                         _logger.info(f"requestId {requestId}: client sent EOS. closing connection.")
+-                        first_max_new_tokens = max(1, int((step + lookahead) / 1280))
++                        # 2026-09-19 xiaowei2 测试发现:原值 (step+lookahead)/1280=320/1280→0
++                        # 取 max(1,·)=1,收尾只允许解码 1 个 token,LSP 未提交的尾部
++                        # token 吐不完(实测丢"的空调,温度调到二十六度"整段尾巴)。
++                        # 收尾是一锤子买卖,给足预算 8,把所有未稳定 token 一次吐完。
++                        first_max_new_tokens = max(8, int((step + lookahead) / 1280))
+                         text= asr_model.finish_streaming_transcribe(
+                             asr_state, first_max_new_tokens
+                         )
+@@ -979,8 +1003,15 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
+                 stream_vad.reset()
+                 _logger.info(f"requestId={requestId}: stream_vad.reset() done")
+ 
++            # 2026-09-19 xiaowei2 测试发现:160ms 块下 step/1280=0 → 首轮预算
++            # max(1,0)=1,每轮只解码 1 个 token。噪声场景(white_5db)实测 13/30
++            # 条整句为空——第一个 token 稍一犹豫,文本就永远起不来(流式解码每轮
++            # 截断后从头再来)。同一音频直连用预算 2 就能完整识别。
++            # 把 floor 从 4 提到 8:160ms 中文语音约 2~6 字/块,预算 8 足够每轮
++            # 吐完当轮内容,同时仍限制单轮解码时长(实测 asr_cost 17→30ms)。
++            # 两处分别在流式/一次性两个 handler,保持一致,只改我们用的流式 handler。
+             max_new_tokens = max(1, int((step + lookahead) / 1280))
+-            max_new_tokens_floor = min(32, max(4,2 * int(step / 1280)))
++            max_new_tokens_floor = min(32, max(8,2 * int(step / 1280)))
+             is_first = True
+             total_secs = LOOKAHEAD_MS / 1000.0
+             is_halluc = False
+@@ -1004,7 +1035,11 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
+                 if isinstance(data, str):
+                     if data == YOUDAO_ONETIME_ASR_EOS_STRING:
+                         _logger.info(f"requestId {requestId}: client sent EOS. closing connection.")
+-                        first_max_new_tokens = max(1, int((step + lookahead) / 1280))
++                        # 2026-09-19 xiaowei2 测试发现:原值 (step+lookahead)/1280=320/1280→0
++                        # 取 max(1,·)=1,收尾只允许解码 1 个 token,LSP 未提交的尾部
++                        # token 吐不完(实测丢"的空调,温度调到二十六度"整段尾巴)。
++                        # 收尾是一锤子买卖,给足预算 8,把所有未稳定 token 一次吐完。
++                        first_max_new_tokens = max(8, int((step + lookahead) / 1280))
+                         text= asr_model.finish_streaming_transcribe_no_reset(
+                             asr_state, first_max_new_tokens
+                         )
+@@ -1246,6 +1281,16 @@ async def asr_stream_api_v1(request: Request, ws: Websocket):
+         await ws.close()
+ 
+ 
++# --- xiaowei 协议接入(2026-09-21):调度器 + 路由工厂,详见 xiaowei_ws_route.py 头注释 ---
++# 调度器是进程级单例:v0/v1 不用,仅 xiaowei 路由用;懒启动 worker,
++# 在 initialize_models 预热阶段(无事件循环)安全。
++# 微批调度(2026-09-21 定稿):单 worker 线程 + 15ms 窗口合批 generate。
++# 三版演进:v1 单 worker 串行(8 路排队 117ms 超标) → v2 多 worker 并行
++# (vLLM V1 generate 线程不安全,EngineCore 崩溃,弃用) → v3 微批合批
++# (一次 generate 消化多路,引擎内部连续批处理,安全且高吞吐)。
++decode_scheduler = ASRDecodeScheduler(micro_batch_wait_ms=int(os.environ.get("R2T2_MICRO_BATCH_WAIT_MS", "15")))
++
++
+ def args_parser():
+     parser = argparse.ArgumentParser(description='asr stream server')
+     # ... (argument parsing code unchanged) ...
+@@ -1266,6 +1311,20 @@ def args_parser():
+         help="Path to the FireRedVAD Stream-VAD model. Defaults to checkpoints/vad/Stream-VAD "
+              "(see the README for how to download it).",
+     )
++    # secret_key 参数化:原代码写死 test0102(debug 值)。默认值保持不变,
++    # 旧客户端(评测脚本/裸协议)零感知;对外部署时用参数覆盖。
++    parser.add_argument(
++        '--secret_key', default="test0102", dest="secret_key",
++        help="secret_key for asr_stream_api_v0/v1 (legacy bare protocol auth)",
++    )
++    # xiaowei 协议入口鉴权 token:与 xiaowei-server Provider 的 api_key 配同值。
++    # 未配置时不注册 xiaowei 路由(防裸奔),v0/v1 不受影响。
++    parser.add_argument(
++        '--xiaowei_ws_token', default=os.environ.get("R2T2_XIAOWEI_WS_TOKEN", ""),
++        dest="xiaowei_ws_token",
++        help="X-Api-Key token for the xiaowei protocol route; "
++             "empty disables the route entirely",
++    )
+     args = parser.parse_args()
+     if not args.asr_model_path:
+         parser.error(
+@@ -1276,6 +1335,46 @@ def args_parser():
+ 
+ args = args_parser()
+ 
++# --- xiaowei 协议路由注册(仅在配置了 token 时) ---
++# X-Api-Key 鉴权对齐 funasr ws_auth_middleware:缺失/不一致 401 拒连。
++# 路由工厂注入全局依赖(模型/VAD/调度器/解码常量),常量与 v1 同源,
++# 保证两条路由的解码行为一致。
++if args.xiaowei_ws_token:
++    # 惰性解析依赖:asr_model/stream_vad 是 initialize_models(sanic listener)
++    # 里才赋值的模块级全局名,本模块加载时还是 None 占位。工厂改成每次
++    # 建连时取"当前"全局值,既避免本处 NameError,也保证 listener 完成后
++    # 拿到的是已加载的模型。调度器/args/常量无此问题(模块级已就绪)。
++    def _xiaowei_deps():
++        return {
++            "asr_model": asr_model, "stream_vad": stream_vad,
++            "scheduler": decode_scheduler, "args": args, "logger": logger,
++            "step": int(round(STEP_MS / 1000.0 * SAMPLING_RATE)),
++            "lookahead": int(round(LOOKAHEAD_MS / 1000.0 * SAMPLING_RATE)),
++            "chunk_asr_size": CHUNK_ASR_SIZE, "sampling_rate": SAMPLING_RATE,
++            "unfix_token_num": UNFIX_TOKEN_NUM,
++            "chunk_asr_seconds": CHUNK_ASR_SECONDS,
++        }
++    _xiaowei_handler = build_xiaowei_ws_handler(_xiaowei_deps)
++
++    @app.websocket("/xiaowei/v1")
++    async def xiaowei_v1_route(request, ws):
++        token = request.headers.get("X-Api-Key", "")
++        if token != args.xiaowei_ws_token:
++            raise Unauthorized("invalid X-Api-Key")
++        await _xiaowei_handler(request, ws)
++
++    @app.websocket("/")
++    async def xiaowei_root_route(request, ws):
++        # 与 funasr 相同的双路径注册:本机测试用 /,nginx 转发用 /xiaowei/v1
++        token = request.headers.get("X-Api-Key", "")
++        if token != args.xiaowei_ws_token:
++            raise Unauthorized("invalid X-Api-Key")
++        await _xiaowei_handler(request, ws)
++
++    logger.info("xiaowei protocol route enabled: / and /xiaowei/v1")
++else:
++    logger.info("xiaowei_ws_token not set, xiaowei route disabled (v0/v1 only)")
++
+ # --- Main program entry point ---
+ if __name__ == '__main__':
+     app.run(host=args.ip, port=int(args.port), single_process=True)
+diff --git a/xiaowei_ws_route.py b/xiaowei_ws_route.py
+new file mode 100644
+index 0000000..41ab3ba
+--- /dev/null
++++ b/xiaowei_ws_route.py
+@@ -0,0 +1,695 @@
++# coding=utf-8
++"""xiaowei 协议路由:xiaowei-server 的 funasr_xiaowei_realtime Provider 可零代码直连。
++
++协议合同(全部经 xiaowei-server 源码核实,详见
++repo/doc/20260920_r2t2_xiaowei_integration_plan.md §1):
++
++- 鉴权:HTTP 头 X-Api-Key,值必须等于启动参数 --xiaowei-ws-token,
++  缺失/不一致 HTTP 401 拒连(对齐 funasr 的 ws_auth_middleware)。
++- 客户端帧:session.start(JSON)/ 二进制 PCM(16k/16bit/mono,provider 侧
++  120ms 组包)/ session.finish(JSON 收口)。
++- 服务端事件(type 为以下精确值,xiaowei-server stream.go 硬编码匹配):
++  session.started / input_audio_buffer.speech_started /
++  conversation.item.input_audio_transcription.text /
++  input_audio_buffer.speech_stopped /
++  conversation.item.input_audio_transcription.completed / session.finished / error
++- readHandshake 强校验(recognizer.go:190-239),不满足直接建连失败:
++  1) 第一帧必须 session.started 且 session.id 非空
++  2) input_audio_format 回显必须 "pcm",sample_rate 必须 16000
++  3) 请求 language 非空时,回显必须与请求一致
++  4) manual(turn_detection=null)回显必须 null;auto/realtime 必须回显
++     server_vad 对象且 threshold/silence_duration_ms 与请求一致(即参数
++     必须真正生效,不能只回显)
++  5) speaker_enabled 请求 true 时必须真支持,否则拒——R2T2 无声纹,
++     请求 true 直接回 error 拒绝,不能静默回显 true
++
++会话模型:一连接一 session(xiaowei-server 每轮对话重建 WS Stream,
++session.finish 只收口不保活,行为对齐)。
++
++解码全走 ASRDecodeScheduler(单 worker 线程),多会话并发时不阻塞事件循环;
++v0/v1 裸协议路由不受本文件影响。
++
++已知约束(并发相关,改动前必读):
++- stream_vad 是进程级全局单例,内部 model_caches 是有状态的流式缓存。
++  多会话并发时 VAD 帧检测在调度器单 worker 里串行执行,天然不会交错
++  污染缓存——但代价是 VAD+ASR 同一线程串行,VAD 每块约 2~5ms。
++  若未来把 VAD 拆独立 worker,必须给每会话独立 FireRedStreamVad 实例
++  (权重共享,from_pretrained 代价低),否则缓存互相污染。
++- asr_state 是每会话局部对象,worker 线程原位更新(闭包传引用),
++  单 worker 串行保证同一时刻只有一个会话在改自己的 state。
++"""
++
++import asyncio
++import json
++import time
++import uuid
++
++import numpy as np
++from sanic import Websocket
++from sanic.exceptions import Unauthorized
++
++from asr_decode_scheduler import ASRDecodeScheduler
++
++SAMPLE_RATE = 16000
++EOS_EVENT = {"type": "session.finish"}
++
++# FireRedVAD 帧长 10ms(constants.py FRAME_SHIFT_MS),xiaowei 协议毫秒值
++# 与 VAD 帧数的换算基数。
++VAD_FRAME_MS = 10
++
++
++class ProtocolError(Exception):
++    """协议错误:发给客户端 error 事件后关闭连接。
++
++    code/message/param 对齐 xiaowei-server parseServerError 的解析字段
++    (recognizer.go:246-255),item_id 可选。
++    """
++
++    def __init__(self, code: str, message: str, param: str = ""):
++        super().__init__(message)
++        self.code = code
++        self.message = message
++        self.param = param
++
++
++def _build_session_vad(global_vad, speech_threshold: float, min_silence_frame: int):
++    """从全局 VAD 实例派生每会话实例:共享权重(feat/model),独立状态。
++
++    FireRedStreamVad 的 from_pretrained 会重新加载权重(慢),这里走
++    浅拷贝路径:复用全局的 audio_feat/vad_model(只读),new 一个按本会话
++    参数配置的 StreamVadPostprocessor 和干净的 model_caches。
++    依赖其内部结构(feat/model/postprocessor/config 字段),
++    fireredvad 升级时需回归此函数。
++    """
++    from fireredvad.core.stream_vad_postprocessor import StreamVadPostprocessor
++    from fireredvad.core.constants import FRAME_LENGTH_SAMPLE
++
++    cfg = global_vad.config
++    postprocessor = StreamVadPostprocessor(
++        cfg.smooth_window_size,
++        speech_threshold,
++        cfg.pad_start_frame,
++        cfg.min_speech_frame,
++        cfg.max_speech_frame,
++        min_silence_frame,
++    )
++    # 构造函数签名里有 chunk_max_frame 默认;直接 new 同类实例,只换状态件
++    import copy
++    session_vad = copy.copy(global_vad)   # 浅拷贝:feat/model 引用共享
++    session_vad.postprocessor = postprocessor
++    session_vad.model_caches = None
++    session_vad.audio_feat = copy.copy(global_vad.audio_feat)  # CMVN 特征缓存有状态,独立
++    session_vad.audio_feat.reset()
++    return session_vad
++
++
++def next_event_id() -> str:
++    return uuid.uuid4().hex[:16]
++
++
++class XiaoweiSessionState:
++    """一个 xiaowei 连接的会话状态(连接期内不可变的部分)。
++
++    threshold/silence_ms 在 session.start 时确定并回显,连接期内不变。
++    """
++
++    def __init__(self, session_id, language, turn_mode, threshold, silence_ms):
++        self.session_id = session_id
++        self.language = language
++        self.turn_mode = turn_mode          # "server_vad" | "manual"
++        self.threshold = threshold
++        self.silence_ms = silence_ms
++
++
++async def send_event(ws: Websocket, payload: dict) -> None:
++    """统一出口:所有事件带 event_id,断连时抛异常由外层收尾。"""
++    payload.setdefault("event_id", next_event_id())
++    await ws.send(json.dumps(payload, ensure_ascii=False))
++
++
++async def send_error_and_close(ws: Websocket, err: ProtocolError) -> None:
++    """按 xiaowei 协议格式发 error 事件,然后正常关闭连接。"""
++    try:
++        await send_event(ws, {
++            "type": "error",
++            "error": {"code": err.code, "message": err.message, "param": err.param},
++        })
++    finally:
++        await ws.close(code=1011)
++
++
++def parse_session_start(raw: str, ws_token: str) -> XiaoweiSessionState:
++    """解析并强校验 session.start,返回会话状态;不合法抛 ProtocolError。
++
++    校验规则对齐 xiaowei-server normalizeRuntimeConfig(recognizer.go:255-284)
++    与 funasr/hojo 服务端同款字段校验:格式/采样率硬校验,VAD 参数范围校验。
++    """
++    try:
++        payload = json.loads(raw)
++    except json.JSONDecodeError:
++        raise ProtocolError("invalid_json", "session.start must be valid JSON", "type")
++    if not isinstance(payload, dict) or payload.get("type") != "session.start":
++        raise ProtocolError("invalid_type", "first message must be session.start", "type")
++    session_cfg = payload.get("session") or {}
++    if not isinstance(session_cfg, dict):
++        raise ProtocolError("invalid_session", "session.start missing session object", "session")
++
++    fmt = str(session_cfg.get("input_audio_format") or "").strip()
++    if fmt != "pcm":
++        raise ProtocolError("unsupported_audio_format", "input_audio_format must be pcm",
++                            "session.input_audio_format")
++    try:
++        rate = int(session_cfg.get("sample_rate") or 0)
++    except (TypeError, ValueError):
++        rate = 0
++    if rate != SAMPLE_RATE:
++        raise ProtocolError("unsupported_sample_rate", f"sample_rate must be {SAMPLE_RATE}",
++                            "session.sample_rate")
++
++    # 声纹:R2T2 无 SV 实现。请求 speaker_enabled=true 或带 enroll_embeddings
++    # 时必须明确拒绝——若静默回显 true,xiaowei-server 握手能过,但后续永远
++    # 收不到 speaker_verify,业务侧静默丢声纹语义,排查成本极高(readHandshake
++    # 第 6 条)。拒绝让上层建连即失败,错误显式。
++    if session_cfg.get("speaker_enabled"):
++        raise ProtocolError("speaker_not_supported", "R2T2 has no speaker verification", "session.speaker_enabled")
++    if session_cfg.get("enroll_embeddings"):
++        raise ProtocolError("speaker_not_supported", "R2T2 has no enroll_embeddings support", "session.enroll_embeddings")
++
++    language = str(session_cfg.get("language") or "").strip()
++    # 空则默认 Chinese:xiaowei-server 侧 language 配置非空时要求回显一致;
++    # 为空不校验。R2T2 内部解码必须显式 language,不能 None(缺陷 #1,
++    # language=None 且模型输出无 <asr_text> 标签时丢整轮文本)。
++    if not language:
++        language = "Chinese"
++
++    turn_detection = session_cfg.get("turn_detection")
++    if isinstance(turn_detection, dict):
++        td_type = str(turn_detection.get("type") or "").strip()
++        if td_type != "server_vad":
++            raise ProtocolError("invalid_session_config",
++                                "turn_detection.type must be server_vad or null", "session.turn_detection.type")
++        try:
++            threshold = float(turn_detection.get("threshold", 0.5))
++            silence_ms = int(turn_detection.get("silence_duration_ms", 800))
++        except (TypeError, ValueError):
++            raise ProtocolError("invalid_session_config", "turn_detection params must be numeric", "session.turn_detection")
++        if threshold <= 0 or threshold > 1:
++            raise ProtocolError("invalid_session_config", "server_vad_threshold must be in (0,1]",
++                                "session.server_vad_threshold")
++        if silence_ms < 150:
++            raise ProtocolError("invalid_session_config", "server_vad_silence_duration_ms must be >= 150",
++                                "session.server_vad_silence_duration_ms")
++        turn_mode = "server_vad"
++    elif turn_detection is None:
++        # manual:整连接单段,R2T2 天然单段语义,正好对齐
++        turn_mode, threshold, silence_ms = "manual", 0.5, 800
++    else:
++        raise ProtocolError("invalid_session_config", "turn_detection must be object or null", "session.turn_detection")
++
++    return XiaoweiSessionState(
++        session_id=uuid.uuid4().hex[:12],
++        language=language,
++        turn_mode=turn_mode,
++        threshold=threshold,
++        silence_ms=silence_ms,
++    )
++
++
++def build_started_event(state: XiaoweiSessionState) -> dict:
++    """构造 session.started:回显值必须与请求一致(readHandshake 强校验)。"""
++    if state.turn_mode == "manual":
++        turn_echo = None
++    else:
++        turn_echo = {
++            "type": "server_vad",
++            "threshold": state.threshold,
++            "silence_duration_ms": state.silence_ms,
++        }
++    return {
++        "type": "session.started",
++        "session": {
++            "id": state.session_id,
++            "language": state.language,
++            "input_audio_format": "pcm",
++            "sample_rate": SAMPLE_RATE,
++            "turn_detection": turn_echo,
++            "speaker_enabled": False,
++            "speaker_verify_enabled": False,
++            "speaker_verify_count": 0,
++            "engine": "confucius4-r2t2",
++        },
++    }
++
++
++class XiaoweiItemTracker:
++    """当前语音段的 item 跟踪:R2T2 一个 VAD 段一个 item。
++
++    text 事件的 text 用累计稳定文本(fixed),stash 恒空——R2T2 的 LSP 机制
++    输出的就是"已定前缀",没有可变尾概念;若把未定尾塞进 stash,客户端
++    TurnBoundaryPolicy 会误判"用户还在说"。preview 用累计值,客户端
++    canonicalizer 按 item_snapshot 语义处理(event_mapper.go buildPreviewEvent)。
++    """
++
++    def __init__(self):
++        self.item_id = ""
++        self.started_ms = None
++        self.ended_ms = None
++        self.preview_sent = False
++        self.content_index = 0
++
++    def open_item(self, now_ms: int) -> str:
++        self.item_id = f"item_{next_event_id()}"
++        self.started_ms = now_ms
++        self.ended_ms = None
++        self.preview_sent = False
++        self.content_index = 0
++        return self.item_id
++
++    def next_content_index(self) -> int:
++        self.content_index += 1
++        return self.content_index
++
++
++def build_xiaowei_ws_handler(deps_provider):
++    """工厂:注入 ws_server 的全局依赖,返回 sanic websocket handler。
++
++    deps_provider 是一个零参函数,每次建连时调用返回最新依赖 dict——
++    因为 asr_model/stream_vad 是 sanic listener(initialize_models)里才
++    赋值的模块级全局名,模块加载时还是 None 占位,不能在工厂构造期解包。
++
++    deps 约定(全部由 ws_server.py 提供):
++      asr_model          - R2T2ASRModel 实例(全局单例)
++      stream_vad         - FireRedStreamVad 实例(全局单例,路由内会派生会话实例)
++      scheduler          - ASRDecodeScheduler 实例(全进程唯一)
++      args               - 启动参数(namespace)
++      logger             - 服务 logger
++      step/lookahead/chunk_asr_size/sampling_rate/unfix_token_num/
++      chunk_asr_seconds  - v1 同款解码常量
++    """
++    # batch_fn 在 worker 线程执行:把窗口内多会话的 payload 合一次调用。
++    # payload = (会话 VAD 实例, asr_state, 音频快照, token 预算)。
++    # 返回与 payload 等长:每项 (vad_results, (text, last_fixed))。
++    # asr_model 从 deps_provider 惰性取(首次调用时模型必已加载)。
++    def xiaowei_batch_fn(payloads):
++        results = []
++        vad_outputs = []
++        decode_jobs = []
++        decode_indexes = []
++        for idx, (vad_instance, st, pcm, budget) in enumerate(payloads):
++            seg_int16 = (pcm * 32768).astype(np.int16)
++            try:
++                vad_outputs.append(vad_instance.detect_chunk(seg_int16))
++            except Exception:
++                logger.exception("vad detect_chunk failed, treat as no-event")
++                vad_outputs.append([])
++            decode_jobs.append((st, pcm, budget))
++            decode_indexes.append(idx)
++
++        model = deps_provider()["asr_model"]
++        decode_results = model.batch_streaming_decode_step(decode_jobs)
++
++        for idx, vad_out, dec in zip(decode_indexes, vad_outputs, decode_results):
++            # dec = None(块未攒满,跳过)或 (text, last_fixed)
++            if dec is None:
++                results.append((vad_out, ("", "")))
++            else:
++                results.append((vad_out, dec))
++        return results
++
++    async def xiaowei_ws_handler(request, ws: Websocket):
++        """一连接一 session。生命周期:
++        session.start(校验+回显)→ PCM 流(160ms 管线解码,增量转 xiaowei
++        事件)→ session.finish(追平尾部)→ session.finished → 关连接。
++        """
++        state: XiaoweiSessionState = None
++        item = XiaoweiItemTracker()
++        session_closed = False
++
++        # ---- 会话内解码状态(全部局部变量,天然会话隔离) ----
++        asr_state = None
++        context = ""
++        audio_buf = np.array([], dtype=np.float32)
++        tmp_audio_pointer = 0
++        is_first = True
++        is_first_seg = True
++        total_secs = 0.0
++        last_fixed_asr_text = ""
++        total_new_asr_tokens = []
++        max_new_tokens = 1
++        max_new_tokens_floor = 8
++        recv_time = time.time()
++
++        # VAD 段级:server_vad 模式下静音断段出 completed;manual 单段到底
++        in_speech = False
++        vad_silence_ms_acc = 0.0
++        speech_ended_in_chunk = False
++
++        try:
++            # 每次建连时解析依赖:asr_model/stream_vad 由 initialize_models
++            # listener 赋值,服务刚启动、模型未加载完成时此处可能拿到 None,
++            # 此时直接报协议错误让客户端重连,不能空指针崩溃。
++            deps = deps_provider()
++            asr_model = deps["asr_model"]
++            stream_vad = deps["stream_vad"]
++            scheduler = deps["scheduler"]
++            args = deps["args"]
++            logger = deps["logger"]
++            step = deps["step"]
++            lookahead = deps["lookahead"]
++            chunk_asr_size = deps["chunk_asr_size"]
++            sampling_rate = deps["sampling_rate"]
++            unfix_token_num = deps["unfix_token_num"]
++            chunk_asr_seconds = deps["chunk_asr_seconds"]
++            if asr_model is None or stream_vad is None:
++                raise ProtocolError("model_not_ready", "ASR model still loading, retry later", "")
++            # batch_fn 是进程级单例注入(所有连接共享同一调度器):
++            # 只在未配置时设置一次;xiaowei_batch_fn 自身无会话状态,
++            # 全部会话状态在各自 payload 里,可安全复用。
++            if scheduler.batch_fn is None:
++                scheduler.batch_fn = xiaowei_batch_fn
++
++            # ---- 1. 握手:第一帧必须是 session.start ----
++            first_raw = await asyncio.wait_for(ws.recv(), timeout=8.0)
++            if not isinstance(first_raw, str):
++                raise ProtocolError("invalid_type", "first message must be session.start JSON", "type")
++            state = parse_session_start(first_raw, args.xiaowei_ws_token)
++            await send_event(ws, build_started_event(state))
++            logger.info(f"sessionId={state.session_id}: xiaowei session started, "
++                        f"language={state.language}, turn_mode={state.turn_mode}")
++
++            asr_state = asr_model.init_streaming_state(
++                context=context,
++                language=state.language,
++                unfixed_chunk_num=0,
++                unfixed_token_num=unfix_token_num,
++                chunk_size_sec=chunk_asr_seconds,
++            )
++
++            # 每会话独立 VAD 实例:共享全局 feat_extractor/vad_model(权重不重载),
++            # 独立 postprocessor(按 session.start 的 threshold/silence 换算)与
++            # model_caches。两件事必须做:
++            # 1) 协议正确性:回显了 silence_duration_ms=800 就要真的按 800ms 断段
++            #    (进程级默认 min_silence_frame=20 即 200ms,自然停顿就会切段,
++            #    实测把 test.wav 切成 3 段且丢字)。
++            # 2) 并发正确性:全局单例的 model_caches 是流式状态,多会话并发
++            #    会互相污染;每会话独立实例后各会话状态隔离。
++            # FireRedVAD 帧长 10ms:ms/10 = 帧数。
++            session_vad = _build_session_vad(
++                stream_vad,
++                speech_threshold=state.threshold,
++                min_silence_frame=max(1, int(state.silence_ms / VAD_FRAME_MS)),
++            )
++            stream_vad = session_vad
++
++            # 收口解码 worker(worker 线程里跑的同步闭包)。
++            # 必须定义在主循环之前:段收口分支与 session.finish 分支都要用,
++            # 若定义在后,闭包捕获的名字在段收口时还未赋值(NameError,
++            # 2026-09-21 冒烟实测踩坑)。
++            def finish_decode(st, budget):
++                return asr_model.finish_streaming_transcribe_no_reset(st, budget)
++
++            # ---- 2. 主循环:收帧 → 组块 → 调度解码 → 发事件 ----
++            while True:
++                raw = await ws.recv()
++                recv_time = time.time()
++
++                if isinstance(raw, str):
++                    try:
++                        evt = json.loads(raw)
++                    except json.JSONDecodeError:
++                        raise ProtocolError("invalid_json", "unrecognized text frame", "type")
++                    etype = evt.get("type") if isinstance(evt, dict) else None
++                    if etype == "session.finish":
++                        break
++                    # 其他控制帧(如未来的 ping):忽略,不报错
++                    logger.info(f"sessionId={state.session_id}: ignore text frame type={etype}")
++                    continue
++
++                # 二进制帧:PCM16 → float32,进缓冲
++                if is_first_seg:
++                    is_wav = len(raw) > 44 and raw[:4] == b"RIFF"
++                    audio_seg = read_pcm_frame(raw, is_wav)
++                    is_first_seg = False
++                else:
++                    audio_seg = read_pcm_frame(raw)
++                audio_buf = np.concatenate((audio_buf, audio_seg))
++
++                if is_first and len(audio_buf) < int(step + lookahead):
++                    continue
++
++                while len(audio_buf) - tmp_audio_pointer >= chunk_asr_size:
++                    # ---- 组块(对齐 v1 首块/后续块策略) ----
++                    if is_first:
++                        asr_state.chunk_size_sec = (step + lookahead) / sampling_rate
++                        asr_state.chunk_size_samples = max(
++                            1, int(round(float(asr_state.chunk_size_sec) * sampling_rate)))
++                        audio_seg = audio_buf[tmp_audio_pointer:tmp_audio_pointer + step + lookahead]
++                        is_first = False
++                        total_secs += (step + lookahead) / sampling_rate
++                        tmp_audio_pointer = step + lookahead
++                    else:
++                        asr_state.chunk_size_sec = chunk_asr_seconds
++                        asr_state.chunk_size_samples = max(
++                            1, int(round(float(asr_state.chunk_size_sec) * sampling_rate)))
++                        audio_seg = audio_buf[tmp_audio_pointer:tmp_audio_pointer + chunk_asr_size]
++                        tmp_audio_pointer += chunk_asr_size
++                        total_secs += chunk_asr_seconds
++
++                    # ---- VAD + 流式解码(合批,worker 线程执行) ----
++                    # payload = (会话 VAD 实例, asr_state, 快照音频, token 预算)。
++                    # 调度器把窗口内多会话的 payload 合一次 batch_fn 调用:
++                    # 里面先各自 VAD 帧检测(独立实例,互不污染),再合批
++                    # generate(vLLM 连续批处理并行;多线程并发调 generate
++                    # 会崩引擎,v2 多 worker 版教训)。VAD 结果随 decode
++                    # 结果一起返回,路由侧据此发段事件。
++                    vad_results, (text, fixed_asr_text) = await scheduler.decode(
++                        job_type="user_partial",
++                        decode_payload=(stream_vad, asr_state, audio_seg, int(max_new_tokens)),
++                        partial_key=state.session_id,
++                    ) or ([], ("", ""))
++
++                    # ---- VAD 事件翻译(仅消费段收口;speech_started 见下方文本分支) ----
++                    for r in vad_results:
++                        if r.is_speech_end:
++                            speech_ended_in_chunk = True
++
++                    now_ms = int(total_secs * 1000)
++                    # speech_started 不在此处发:FireRedVAD 对连续语音可能
++                    # 不及时置 is_speech_start(实测吞 text 事件),改为
++                    # "首个稳定增量到达时补开 item"(见下方文本事件分支)。
++
++                    # ---- 文本事件:增量 → 累计快照 ----
++                    # item 开启不依赖 VAD 判定:解码器吐出首个稳定增量即说明
++                    # 有语音(实测 FireRedVAD postprocessor 状态机对连续语音
++                    # 不一定及时置 is_speech_start,依赖它会吞掉所有 text 事件,
++                    # 2026-09-21 冒烟踩坑)。VAD 仍用于段收口(is_speech_end)。
++                    if len(fixed_asr_text) > len(last_fixed_asr_text):
++                        new_text = fixed_asr_text[len(last_fixed_asr_text):]
++                        last_fixed_asr_text = fixed_asr_text
++                        for w in split_text_to_tokens(new_text):
++                            total_new_asr_tokens.append(w)
++                            if len(total_new_asr_tokens) > 50:
++                                total_new_asr_tokens.pop(0)
++                        max_new_tokens = max(1, int(step / 1280))
++
++                        if not in_speech:
++                            # 文本先于 VAD 置位(或 VAD 没触发):补开 item,
++                            # speech_started 事件不能少——xiaowei-server 的
++                            # canonicalizer 需要它建立 item 生命周期
++                            in_speech = True
++                            if not item.item_id:
++                                item.open_item(now_ms)
++                            await send_event(ws, {
++                                "type": "input_audio_buffer.speech_started",
++                                "item_id": item.item_id,
++                                "audio_start_ms": now_ms,
++                            })
++                        await send_event(ws, {
++                            "type": "conversation.item.input_audio_transcription.text",
++                            "item_id": item.item_id,
++                            "content_index": item.next_content_index(),
++                            "language": state.language,
++                            "text": last_fixed_asr_text,
++                            "stash": "",
++                            "audio_start_ms": item.started_ms or 0,
++                            "audio_end_ms": now_ms,
++                        })
++                        item.preview_sent = True
++                    else:
++                        # 无新文本:预算自愈策略对齐 v1(非中文尾 token 逐步加预算)
++                        if not is_last_token_chinese(total_new_asr_tokens):
++                            max_new_tokens = max_new_tokens + 0.5
++                        else:
++                            max_new_tokens = max(1, int(step / 1280))
++                    if is_last_token_chinese(total_new_asr_tokens):
++                        max_new_tokens = 2 * max_new_tokens
++                    max_new_tokens = min(max_new_tokens_floor, max_new_tokens)
++
++                    # ---- 段收口(server_vad 静音断段) ----
++                    if speech_ended_in_chunk and state.turn_mode == "server_vad" and in_speech:
++                        speech_ended_in_chunk = False
++                        in_speech = False
++                        # 收口必须先 finish 追平:asr_state.text 只含已稳定
++                        # 部分,未提交的 LSP 尾部 token(实测每段 1~3 字)会丢。
++                        # 追平后再重置状态开启新段。高优任务,不被其他会话
++                        # 的 partial 挡住。
++                        seg_budget = max(8, int((step + lookahead) / 1280))
++                        seg_text = await scheduler.decode(
++                            job_type="completed",
++                            decode_fn=lambda: finish_decode(asr_state, seg_budget),
++                        )
++                        seg_text = (seg_text or "").split("|")[0]
++                        if len(seg_text) > len(last_fixed_asr_text):
++                            seg_text = last_fixed_asr_text + seg_text[len(last_fixed_asr_text):]
++                        transcript = seg_text.strip()
++                        ended_ms = now_ms
++                        # 段收口是高优任务:不让它排在其他会话的 partial 后面
++                        asr_state = asr_model.init_streaming_state(
++                            context=context,
++                            language=state.language,
++                            unfixed_chunk_num=0,
++                            unfixed_token_num=unfix_token_num,
++                            chunk_size_sec=chunk_asr_seconds,
++                        )
++                        last_fixed_asr_text = ""
++                        total_new_asr_tokens = []
++
++                        await send_event(ws, {
++                            "type": "input_audio_buffer.speech_stopped",
++                            "item_id": item.item_id,
++                            "audio_end_ms": ended_ms,
++                        })
++                        if transcript:
++                            await send_event(ws, {
++                                "type": "conversation.item.input_audio_transcription.completed",
++                                "item_id": item.item_id,
++                                "content_index": item.next_content_index(),
++                                "language": state.language,
++                                "transcript": transcript,
++                                "audio_start_ms": item.started_ms or 0,
++                                "audio_end_ms": ended_ms,
++                            })
++                        item.preview_sent = False
++
++                # 消费完的音频出缓冲(对齐 v1)
++                if len(audio_buf) != 0:
++                    audio_buf = audio_buf[tmp_audio_pointer:]
++                tmp_audio_pointer = 0
++
++            # ---- 3. session.finish:追平尾部,收口当前段 ----
++            final_budget = max(8, int((step + lookahead) / 1280))
++            final_text = await scheduler.decode(
++                job_type="completed",
++                decode_fn=lambda: finish_decode(asr_state, final_budget),
++            )
++            final_text = (final_text or "").split("|")[0]
++            # finish 返回的是当前段累计全文(state.text 语义):流式期间已发过
++            # 增量的部分不重复,只补尾部;从未发过增量(短音频一锤子)则全量。
++            if len(final_text) > len(last_fixed_asr_text):
++                final_text = last_fixed_asr_text + final_text[len(last_fixed_asr_text):]
++            else:
++                final_text = last_fixed_asr_text
++            transcript = final_text.strip()
++
++            now_ms = int(total_secs * 1000)
++            if state.turn_mode == "server_vad" and in_speech:
++                await send_event(ws, {
++                    "type": "input_audio_buffer.speech_stopped",
++                    "item_id": item.item_id,
++                    "audio_end_ms": now_ms,
++                })
++            if transcript:
++                if not item.item_id:
++                    item.open_item(0)
++                await send_event(ws, {
++                    "type": "conversation.item.input_audio_transcription.completed",
++                    "item_id": item.item_id,
++                    "content_index": item.next_content_index(),
++                    "language": state.language,
++                    "transcript": transcript,
++                    "audio_start_ms": item.started_ms or 0,
++                    "audio_end_ms": now_ms,
++                })
++            await send_event(ws, {
++                "type": "session.finished",
++                "session": {"id": state.session_id, "reason": "client_finish"},
++            })
++            session_closed = True
++
++        except ProtocolError as e:
++            logger.warning(f"sessionId={getattr(state, 'session_id', '?')}: protocol error: {e.message}")
++            await send_error_and_close(ws, e)
++            session_closed = True
++        except asyncio.TimeoutError:
++            logger.warning("xiaowei ws: handshake timeout")
++            await ws.close(code=1011)
++            session_closed = True
++        except Exception:
++            logger.exception("xiaowei ws handler crashed")
++            if not session_closed:
++                try:
++                    await ws.close(code=1011)
++                except Exception:
++                    pass
++        finally:
++            await ws.close()
++
++    return xiaowei_ws_handler
++
++
++def read_pcm_frame(raw: bytes, is_wav: bool = False) -> np.ndarray:
++    """二进制帧 → float32 单声道。16bit LE PCM;首帧允许带 WAV 头。
++
++    逻辑复制自 ws_server.read_pcm(不 import ws_server:模块二次加载会
++    触发 Sanic app 名冲突崩溃,实测于 2026-09-21 冒烟)。上游若改此逻辑,
++    两处需同步。
++    """
++    pcm_data = np.frombuffer(raw, dtype=np.int16, offset=44 if is_wav else 0)
++    return (pcm_data / (2 ** 15)).astype(np.float32)
++
++
++def frame_has_wav_header(raw: bytes) -> bool:
++    """复制自 ws_server.if_contains_wav_header。"""
++    if len(raw) < 12:
++        return False
++    if raw[0:4] != b"RIFF" or raw[8:12] != b"WAVE":
++        return False
++    return True
++
++
++_PUNCT_CN = ("？！＂＃＄％＆＇（）＊＋，－／：；＜＝＞＠［＼］＾＿｀｛｜｝～、。〃〄々〆〇〈〉《》「」『』【】〔〕"
++             "〖〗〘〙〚〛〜〝〞〟〰〾〿–—‘’‛“”„‟…‧﹏")
++_PUNCT_ALL = None  # 延迟初始化(string.punctuation 在模块级 import string 后拼)
++
++
++def _remove_punctuation(text: str) -> str:
++    """复制自 ws_server.remove_punctuation。"""
++    import string
++    global _PUNCT_ALL
++    if _PUNCT_ALL is None:
++        _PUNCT_ALL = string.punctuation + _PUNCT_CN
++    return text.translate(str.maketrans("", "", _PUNCT_ALL))
++
++
++_TOKEN_PATTERN = __import__("re").compile(r"[a-zA-Z]+|[^a-zA-Z]")
++
++
++def split_text_to_tokens(text: str) -> list:
++    """复制自 ws_server.split_text_to_tokens:中文按字/英文按词切,去标点。"""
++    text = _remove_punctuation(text)
++    tokens = []
++    for match in _TOKEN_PATTERN.finditer(text):
++        token = match.group()
++        if token.strip():
++            tokens.append(token)
++    return tokens
++
++
++def is_last_token_chinese(new_asr_tokens: list) -> bool:
++    """复制自 ws_server.is_last_token_chinese:尾 token 是否含汉字。"""
++    if not new_asr_tokens:
++        return False
++    for ch in new_asr_tokens[-1]:
++        if "\u4e00" <= ch <= "\u9fff":
++            return True
++    return False
