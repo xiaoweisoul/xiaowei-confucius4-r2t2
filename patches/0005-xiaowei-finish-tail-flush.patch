@@ -1,0 +1,27 @@
+diff --git a/r2t2/r2t2_asr.py b/r2t2/r2t2_asr.py
+index 41ab3ba..be6b269 100644
+--- a/r2t2/r2t2_asr.py
++++ b/r2t2/r2t2_asr.py
+@@ -973,13 +973,18 @@
+         if state is None:
+             raise ValueError("state must not be None.")
+ 
+-        # If no remaining buffer, still return state as-is.
+-        if state.buffer is None or state.buffer.shape[0] == 0:
+-            # print(f"22text={state.text}")
++        # If no tail audio remains, still run one final decode to confirm the
++        # trailing token: streaming keeps the last UNFIX_TOKEN_NUM token(s)
++        # uncommitted until the next chunk arrives. When the audio happens to
++        # end exactly on a chunk boundary, buffer is empty and that tail would
++        # be lost forever (e.g. "拜拜" 0.64s -> "拜", "好的好的" 0.96s ->
++        # "好的，"). Skip only when no audio was received at all.
++        if state.buffer is None:
+             return state.last_fixed_text
+-
+         tail = state.buffer
+         state.buffer = np.zeros((0,), dtype=np.float32)
++        if tail.shape[0] == 0 and state.audio_accum.shape[0] == 0:
++            return state.last_fixed_text
+ 
+         # Append tail to accumulated audio
+         if state.audio_accum.shape[0] == 0:
