@@ -1,0 +1,35 @@
+diff --git a/xiaowei_ws_route.py b/xiaowei_ws_route.py
+index 41ab3ba..be6b269 100644
+--- a/xiaowei_ws_route.py
++++ b/xiaowei_ws_route.py
+@@ -265,6 +265,20 @@ class XiaoweiItemTracker:
+         self.content_index = 0
+         return self.item_id
+ 
++    def close_item(self) -> None:
++        """收口当前 item,清空 id——下一段语音到达时 open_item 生成新 id。
++
++        背景(2026-09-21 真机测试定位):server_vad 长连接多段会话里,
++        段收口后若不重置,下段文本事件继续复用旧 item_id——xiaowei-server
++        的 TurnBuffer/canonicalizer 按 item 键控,13 轮共用一个 item 是
++        隐患(preview 撤销/丢弃逻辑会误判)。每段收口后必须开新 item。
++        """
++        self.item_id = ""
++        self.started_ms = None
++        self.ended_ms = None
++        self.preview_sent = False
++        self.content_index = 0
++
+     def next_content_index(self) -> int:
+         self.content_index += 1
+         return self.content_index
+@@ -570,6 +584,9 @@ def build_xiaowei_ws_handler(deps_provider):
+                                 "audio_end_ms": ended_ms,
+                             })
+                         item.preview_sent = False
++                        # 段收口后重置 item:下段语音必须用新 item_id
++                        # (真机 13 轮共用 1 个 item_id 的隐患修复,见 close_item)
++                        item.close_item()
+ 
+                 # 消费完的音频出缓冲(对齐 v1)
+                 if len(audio_buf) != 0:
