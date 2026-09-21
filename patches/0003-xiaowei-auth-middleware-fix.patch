@@ -1,0 +1,35 @@
+diff --git a/ws_server.py b/ws_server.py
+index 9bc8510..7803e65 100644
+--- a/ws_server.py
++++ b/ws_server.py
+@@ -1356,19 +1356,24 @@ if args.xiaowei_ws_token:
+         }
+     _xiaowei_handler = build_xiaowei_ws_handler(_xiaowei_deps)
+ 
++    @app.middleware  # request middleware 在 websocket 升级前执行(对齐 funasr)
++    async def xiaowei_ws_auth(request):
++        # sanic 25.x 无 websocket middleware 类型(MiddlewareLocation 只有
++        # request/response);websocket 握手是带 Upgrade 头的 HTTP 请求,
++        # request middleware 天然在升级前拦截。只拦 xiaowei 协议路由
++        # (/xiaowei/v1 与 /),v0/v1 的 secret_key 鉴权不受影响。
++        if request.path in ("/xiaowei/v1", "/"):
++            token = request.headers.get("X-Api-Key", "")
++            if token != args.xiaowei_ws_token:
++                raise Unauthorized("invalid X-Api-Key")
++
+     @app.websocket("/xiaowei/v1")
+     async def xiaowei_v1_route(request, ws):
+-        token = request.headers.get("X-Api-Key", "")
+-        if token != args.xiaowei_ws_token:
+-            raise Unauthorized("invalid X-Api-Key")
+         await _xiaowei_handler(request, ws)
+ 
+     @app.websocket("/")
+     async def xiaowei_root_route(request, ws):
+         # 与 funasr 相同的双路径注册:本机测试用 /,nginx 转发用 /xiaowei/v1
+-        token = request.headers.get("X-Api-Key", "")
+-        if token != args.xiaowei_ws_token:
+-            raise Unauthorized("invalid X-Api-Key")
+         await _xiaowei_handler(request, ws)
+ 
+     logger.info("xiaowei protocol route enabled: / and /xiaowei/v1")
