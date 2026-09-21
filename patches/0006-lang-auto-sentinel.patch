@@ -1,0 +1,42 @@
+diff --git a/r2t2/r2t2_asr.py b/r2t2/r2t2_asr.py
+index ce5b004..a2add36 100644
+--- a/r2t2/r2t2_asr.py
++++ b/r2t2/r2t2_asr.py
+@@ -271,9 +271,17 @@ class R2T2ASRModel(Qwen3ASRModel):
+ 
+         force_language = None
+         if language is not None and str(language).strip() != "":
+-            ln = normalize_language_name(str(language))
+-            validate_language(ln)
+-            force_language = ln
++            ln = str(language).strip()
++            if ln.lower() == "auto":
++                # auto 哨兵:不强制语言——prompt 不加 language 标签,
++                # 依赖模型在输出中自带 <asr_text> 语言标签;模型无标签时
++                # 语言不受控(按纯文本处理)。与 xiaowei_ws_route 的
++                # language="auto" 协议约定对应。
++                force_language = None
++            else:
++                ln = normalize_language_name(ln)
++                validate_language(ln)
++                force_language = ln
+ 
+         chunk_size_samples = int(round(float(chunk_size_sec) * SAMPLE_RATE))
+         chunk_size_samples = max(1, chunk_size_samples)
+diff --git a/xiaowei_ws_route.py b/xiaowei_ws_route.py
+index be6b269..f39266e 100644
+--- a/xiaowei_ws_route.py
++++ b/xiaowei_ws_route.py
+@@ -179,8 +179,12 @@ def parse_session_start(raw: str, ws_token: str) -> XiaoweiSessionState:
+     # 空则默认 Chinese:xiaowei-server 侧 language 配置非空时要求回显一致;
+     # 为空不校验。R2T2 内部解码必须显式 language,不能 None(缺陷 #1,
+     # language=None 且模型输出无 <asr_text> 标签时丢整轮文本)。
++    # auto 哨兵:显式请求"不强制语言"——不校验、不兜底,回显 auto,
++    # 引擎层 force_language=None,依赖模型自带 <asr_text> 语言标签。
+     if not language:
+         language = "Chinese"
++    elif language.lower() == "auto":
++        language = "auto"
+ 
+     turn_detection = session_cfg.get("turn_detection")
+     if isinstance(turn_detection, dict):
